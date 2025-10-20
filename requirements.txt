@@ -1,0 +1,8 @@
+imapclient
+pyzmail36
+pandas
+openpyxl
+python-dotenv
+tzdata
+msal
+requests
