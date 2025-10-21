@@ -1,5 +1,4 @@
 # interface_adapters/controllers/polling_controller.py
-# interface_adapters/controllers/polling_controller.py
 from __future__ import annotations
 import logging
 from pathlib import Path
@@ -25,6 +24,11 @@ class PollingController:
             etl_cmd=settings.etl_cmd_parts(),
             etl_workdir=settings.etl_workdir_path(),
             temp_storage_dir=Path("./_tmp").resolve(),
+            # ── snapshot (2º proceso) ──
+            snapshot_enabled=settings.SNAPSHOT_ENABLED,
+            snapshot_cmd_builder=settings.snapshot_cmd_parts,
+            snapshot_workdir=settings.snapshot_workdir_path(),
+            snapshot_timeout=settings.SNAPSHOT_TIMEOUT,
         )
 
         if self.settings.EMAIL_PROVIDER == "graph":
@@ -48,7 +52,6 @@ class PollingController:
         st = self.settings
 
         if st.EMAIL_PROVIDER == "graph":
-            # 1) listar no leídos
             items = self.client.list_unread(st.GRAPH_FOLDER_INBOX, top=st.MAX_MAILS_PER_LOOP)
             if not items:
                 logger.info("Sin correos nuevos (Graph).")
@@ -59,7 +62,6 @@ class PollingController:
                 mid = item["id"]
                 subject = item.get("subject") or ""
                 from_addr = (item.get("from", {}) or {}).get("emailAddress", {}).get("address", "")
-                # 2) attachments
                 atts_raw = self.client.get_message_attachments(mid)
                 attachments: list[Attachment] = []
                 for ar in atts_raw:

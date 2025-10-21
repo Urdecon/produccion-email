@@ -26,32 +26,49 @@ def _first_of_month_str(ym: str) -> str:
     # fallback: devolver tal cual
     return s
 
+def _find_to_the_right(ws_ini: pd.DataFrame, label: str) -> str:
+    """
+    Busca 'label' en cualquier columna de la hoja 'Inicio' y devuelve el valor de la celda a la derecha.
+    - Coincidencia exacta tras strip (sensibilidad normal; en tu plantilla coincide tal cual).
+    - Si el label está en la última columna, devuelve "".
+    """
+    # Normalizamos a strings para comparar
+    df = ws_ini.fillna("").astype(str)
+    # Recorremos todas las celdas buscando el label
+    for r in range(df.shape[0]):
+        for c in range(df.shape[1]):
+            if df.iat[r, c].strip() == label:
+                # celda a la derecha
+                if c + 1 < df.shape[1]:
+                    return str(ws_ini.iat[r, c + 1])
+                return ""
+    # No encontrado
+    return ""
+
 def build_payload_from_excel(fp: Path) -> dict:
     """
     Lee tu plantilla:
-      - Hoja 'Inicio': Mes_Clave (auto), Empresa, Proyecto
-      - 'Produccion': A..F
-      - 'Pendientes': A..F
+      - Hoja 'Inicio':
+            · Mes_Clave (auto)  → valor a la derecha (p.ej. F6)
+            · Empresa           → valor a la derecha (p.ej. F7)
+            · Proyecto          → valor a la derecha (p.ej. B8)
+      - 'Produccion': A..F (posición)
+      - 'Pendientes': A..F (posición)
     """
-    # --- Inicio ---
+    # --- Inicio (sin encabezados, para poder buscar por etiqueta) ---
     ws_ini = pd.read_excel(fp, sheet_name="Inicio", header=None, dtype="object")
-    # buscar etiquetas en col A
-    def _find_right(label: str) -> str:
-        rows = ws_ini[ws_ini.iloc[:, 0].astype(str).str.strip() == label]
-        if rows.empty:
-            return ""
-        row_idx = rows.index[0]
-        return str(ws_ini.iloc[row_idx, 1]) if ws_ini.shape[1] > 1 else ""
-    mes_clave = _find_right("Mes_Clave (auto)")
-    empresa = _find_right("Empresa")
-    proyecto = _find_right("Proyecto")
+
+    mes_clave = _find_to_the_right(ws_ini, "Mes_Clave (auto)")
+    empresa = _find_to_the_right(ws_ini, "Empresa")
+    proyecto = _find_to_the_right(ws_ini, "Proyecto")
+
     fecha_seguimiento = _first_of_month_str(mes_clave)
 
     # --- Produccion ---
     cols_seg = ["Mes", "Capitulo", "Capitulo_Cod", "Certificacion", "RestoProd", "Observaciones"]
     try:
         seg = pd.read_excel(fp, sheet_name="Produccion", header=0, dtype="object")
-        # Normalizar nombres por posición por si cambian encabezados
+        # Normalizar por posición (primeras 6 columnas)
         seg = seg.iloc[:, :6]
         seg.columns = cols_seg
         seg = seg[seg["Capitulo"].astype(str).str.strip() != ""].copy()
@@ -61,8 +78,8 @@ def build_payload_from_excel(fp: Path) -> dict:
         seguimiento = [
             {
                 "fecha_produccion": r["fecha_produccion"],
-                "capitulo": str(r["Capitulo"]) if r["Capitulo"] is not None else "",
-                "capitulo_codigo": str(r["Capitulo_Cod"]) if r["Capitulo_Cod"] is not None else "",
+                "capitulo": "" if pd.isna(r["Capitulo"]) else str(r["Capitulo"]),
+                "capitulo_codigo": "" if pd.isna(r["Capitulo_Cod"]) else str(r["Capitulo_Cod"]),
                 "certificacion_pendiente": r["certificacion_pendiente"],
                 "resto_produccion": r["resto_produccion"],
                 "observaciones": "" if pd.isna(r["Observaciones"]) else str(r["Observaciones"]),
@@ -84,8 +101,8 @@ def build_payload_from_excel(fp: Path) -> dict:
         pendientes = [
             {
                 "fecha_produccion": r["fecha_produccion"],
-                "capitulo": str(r["Capitulo"]) if r["Capitulo"] is not None else "",
-                "capitulo_codigo": str(r["Capitulo_Cod"]) if r["Capitulo_Cod"] is not None else "",
+                "capitulo": "" if pd.isna(r["Capitulo"]) else str(r["Capitulo"]),
+                "capitulo_codigo": "" if pd.isna(r["Capitulo_Cod"]) else str(r["Capitulo_Cod"]),
                 "proveedor": "" if pd.isna(r["Proveedor"]) else str(r["Proveedor"]),
                 "coste_pendiente": r["coste_pendiente"],
                 "observaciones": "" if pd.isna(r["Observaciones"]) else str(r["Observaciones"]),
@@ -99,9 +116,9 @@ def build_payload_from_excel(fp: Path) -> dict:
         "selected_cases": ["seguimiento", "pendientes"],
         "payload": {
             "header": {
-                "fecha_seguimiento": fecha_seguimiento,
-                "empresa": "" if empresa is None else str(empresa),
-                "proyecto": "" if proyecto is None else str(proyecto),
+                "fecha_seguimiento": "" if fecha_seguimiento is None else str(fecha_seguimiento).strip(),
+                "empresa": "" if empresa is None else str(empresa).strip(),
+                "proyecto": "" if proyecto is None else str(proyecto).strip(),
             },
             "seguimiento": seguimiento,
             "pendientes": pendientes,
