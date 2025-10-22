@@ -3,8 +3,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 from pathlib import Path
-from typing import Callable, Literal
-from datetime import datetime
+from typing import Literal, Any
 
 from domain.models import MailItem
 from application.services.excel_to_payload import build_payload_from_excel
@@ -25,11 +24,12 @@ class ProcessMailUseCase:
         etl_cmd: list[str],
         etl_workdir: Path,
         temp_storage_dir: Path,
-        # ── snapshot (2º proceso) ──
-        snapshot_enabled: bool,
-        snapshot_cmd_builder: Callable[[str, str, int, int], list[str]],
-        snapshot_workdir: Path,
-        snapshot_timeout: int,
+        etl_timeout: int = 600,
+        # snapshot settings (opcionales; se pasan desde PollingController vía setattr si prefieres)
+        snapshot_enabled: bool = False,
+        snapshot_py: Path | None = None,
+        snapshot_workdir: Path | None = None,
+        snapshot_timeout: int = 900,
     ) -> None:
         self.allowed_senders = allowed_senders
         self.subject_filters = subject_filters
@@ -37,9 +37,10 @@ class ProcessMailUseCase:
         self.etl_cmd = etl_cmd
         self.etl_workdir = etl_workdir
         self.temp_storage_dir = temp_storage_dir
+        self.etl_timeout = etl_timeout
 
         self.snapshot_enabled = snapshot_enabled
-        self.snapshot_cmd_builder = snapshot_cmd_builder
+        self.snapshot_py = snapshot_py
         self.snapshot_workdir = snapshot_workdir
         self.snapshot_timeout = snapshot_timeout
 
@@ -55,27 +56,22 @@ class ProcessMailUseCase:
         s = (subj or "").lower()
         return any(token in s for token in self.subject_filters)
 
-    @staticmethod
-    def _ym_from_fecha(fecha_ddmmyyyy: str) -> tuple[int, int] | None:
+    def process_mail(self, mail: MailItem, saver) -> dict[str, Any]:
         """
-        Convierte '01/08/2025' → (2025, 8). Devuelve None si no parsea.
+        Devuelve: {
+            "outcome": "processed" | "not_processed" | "error",
+            "headers": [ {empresa, proyecto, fecha_seguimiento}, ...]  # uno por cada Excel válido
+        }
         """
-        try:
-            dt = datetime.strptime(fecha_ddmmyyyy.strip(), "%d/%m/%Y")
-            return dt.year, dt.month
-        except Exception:
-            return None
-
-    def process_mail(self, mail: MailItem, saver) -> Outcome:
         # 1) Remitente permitido
         if not self._sender_ok(mail.from_addr):
             logger.info("Not processed (sender no permitido): %s", mail.from_addr)
-            return "not_processed"
+            return {"outcome": "not_processed", "headers": []}
 
         # 2) Asunto (si configurado)
         if not self._subject_ok(mail.subject):
             logger.info("Not processed (asunto no coincide): %s", mail.subject)
-            return "not_processed"
+            return {"outcome": "not_processed", "headers": []}
 
         # 3) Filtrar adjuntos .xlsx
         excel_files: list[Path] = []
@@ -88,54 +84,63 @@ class ProcessMailUseCase:
 
         if not excel_files:
             logger.info("Not processed (sin adjuntos .xlsx válidos).")
-            return "not_processed"
+            return {"outcome": "not_processed", "headers": []}
 
-        # 4) Procesar cada Excel
+        # 4) Procesar cada Excel → ETL y (si procede) Snapshot
         all_ok = True
+        headers: list[dict[str, str]] = []
+
         for fp in excel_files:
             try:
-                # a) construir payload y lanzar ETL
                 payload = build_payload_from_excel(fp)
+                # Guardamos cabeceras para notificaciones / snapshot
+                hdr = (payload.get("payload", {}) or {}).get("header", {}) or {}
+                headers.append({
+                    "empresa": hdr.get("empresa") or "",
+                    "proyecto": hdr.get("proyecto") or "",
+                    "fecha_seguimiento": hdr.get("fecha_seguimiento") or "",
+                })
+
                 code, stdout, stderr = run_etl_json(payload, self.etl_cmd, self.etl_workdir)
                 if code == 0:
-                    logger.info("ETL OK %s: %s", fp.name, stdout.strip() or "(sin salida)")
+                    logger.info("ETL OK %s: %s", fp.name, stdout.strip())
                 else:
                     logger.error("ETL ERROR %s (code=%s): %s", fp.name, code, stderr.strip())
                     all_ok = False
-                    # No lanzamos snapshot si ETL falla
-                    continue
+                    continue  # no lanzar snapshot si ETL falla
 
-                # b) snapshot opcional tras ETL OK
+                # ── SNAPSHOT ──
                 if self.snapshot_enabled:
-                    header = payload.get("payload", {}).get("header", {}) if isinstance(payload, dict) else {}
-                    company = (header.get("empresa") or "").strip()
-                    project = (header.get("proyecto") or "").strip()
-                    fecha_seg = (header.get("fecha_seguimiento") or "").strip()
-                    ym = self._ym_from_fecha(fecha_seg)
-
-                    if not company or not project or ym is None:
-                        logger.error(
-                            "Snapshot SKIP %s: faltan datos header (empresa/proyecto/fecha_seguimiento).", fp.name
-                        )
+                    empresa = hdr.get("empresa")
+                    proyecto = hdr.get("proyecto")
+                    fecha = hdr.get("fecha_seguimiento")
+                    if not (empresa and proyecto and fecha):
+                        logger.error("Snapshot SKIP %s: faltan datos header (empresa/proyecto/fecha_seguimiento).", fp.name)
                         all_ok = False
-                        continue
-
-                    year, month = ym
-                    cmd = self.snapshot_cmd_builder(company, project, year, month)
-                    rc, out, err = run_snapshot(
-                        cmd_parts=cmd,
-                        workdir=self.snapshot_workdir,
-                        timeout=self.snapshot_timeout,
-                    )
-                    if rc == 0:
-                        logger.info("Snapshot OK %s → %s/%s %04d-%02d: %s",
-                                    fp.name, company, project, year, month, (out.strip() or "(sin salida)"))
                     else:
-                        logger.error("Snapshot ERROR %s (code=%s): %s", fp.name, rc, err.strip())
-                        all_ok = False
+                        try:
+                            y = int(fecha[-4:])        # "01/MM/YYYY" → YYYY
+                            m = int(fecha[3:5])        # → MM
+                            rc, so, se = run_snapshot(
+                                python_exe=self.snapshot_py,          # type: ignore[arg-type]
+                                workdir=self.snapshot_workdir,        # type: ignore[arg-type]
+                                company=empresa,
+                                project=proyecto,
+                                year=y,
+                                month=m,
+                                timeout=self.snapshot_timeout,
+                            )
+                            if rc == 0:
+                                logger.info("Snapshot OK %s: %s", fp.name, (so or "").strip() or "OK")
+                            else:
+                                logger.error("Snapshot ERROR %s (code=%s): %s", fp.name, rc, (se or so or "").strip())
+                                all_ok = False
+                        except Exception:
+                            logger.exception("Snapshot EXCEPTION %s", fp.name)
+                            all_ok = False
 
             except Exception:
                 logger.exception("Fallo procesando %s", fp.name)
                 all_ok = False
 
-        return "processed" if all_ok else "error"
+        return {"outcome": "processed" if all_ok else "error", "headers": headers}

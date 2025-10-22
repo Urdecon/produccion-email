@@ -11,7 +11,7 @@ load_dotenv()
 class Settings:
     EMAIL_PROVIDER: str = os.getenv("EMAIL_PROVIDER", "graph").lower()  # graph | imap
 
-    # IMAP (por si mantienes fallback)
+    # IMAP (fallback opcional)
     IMAP_HOST: str = os.getenv("IMAP_HOST", "outlook.office365.com")
     IMAP_PORT: int = int(os.getenv("IMAP_PORT", 993))
     IMAP_USERNAME: str = os.getenv("IMAP_USERNAME", "")
@@ -39,25 +39,27 @@ class Settings:
     ATTACH_WHITELIST: str = os.getenv("ATTACH_WHITELIST", ".xlsx")
     TZ: str = os.getenv("TZ", "Europe/Madrid")
 
-    # ETL (proyecto sharepoint_reader)
+    # ETL
     ETL_WORKDIR: str = os.getenv("ETL_WORKDIR", "")
-    ETL_RUN_CMD: str = os.getenv("ETL_RUN_CMD", "")  # p.ej.: C:/.../.venv/Scripts/python.exe -m interface_adapters.controllers.etl_api_entry
-    ETL_TIMEOUT: int = int(os.getenv("ETL_TIMEOUT", "600"))
+    ETL_RUN_CMD: str = os.getenv("ETL_RUN_CMD", "")
+    ETL_TIMEOUT: int = int(os.getenv("ETL_TIMEOUT", 600))
+
+    # Snapshot
+    SNAPSHOT_ENABLED: bool = os.getenv("SNAPSHOT_ENABLED", "true").lower() == "true"
+    SNAPSHOT_WORKDIR: str = os.getenv("SNAPSHOT_WORKDIR", "")  # carpeta del repo snapshot (donde está main.py)
+    SNAPSHOT_PY: str = os.getenv("SNAPSHOT_PY", "")            # .../venv/Scripts/python.exe
+    SNAPSHOT_TIMEOUT: int = int(os.getenv("SNAPSHOT_TIMEOUT", 900))
+
+    # Notificaciones / logs
+    LOG_MODE: str = os.getenv("LOG_MODE", "email").lower()     # email | none | both
+    LOG_EMAIL_TO: str = os.getenv("LOG_EMAIL_TO", "informatica@urdecon.es")
+    SUCCESS_NOTIFY: bool = os.getenv("SUCCESS_NOTIFY", "true").lower() == "true"
 
     # Polling
     POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", 30))
     MAX_MAILS_PER_LOOP: int = int(os.getenv("MAX_MAILS_PER_LOOP", 20))
 
-    # ───────── SNAPSHOT (2º proceso) ─────────
-    # Si está habilitado, se lanza SOLO tras ETL OK. Se infiere company/project/year/month del Excel.
-    SNAPSHOT_ENABLED: bool = os.getenv("SNAPSHOT_ENABLED", "false").lower() == "true"
-    SNAPSHOT_WORKDIR: str = os.getenv("SNAPSHOT_WORKDIR", "")  # raíz del repo snapshot
-    SNAPSHOT_PY: str = os.getenv("SNAPSHOT_PY", "python")      # intérprete del venv del snapshot
-    SNAPSHOT_TIMEOUT: int = int(os.getenv("SNAPSHOT_TIMEOUT", "900"))
-    # Archivo/función de entrada: usaremos main.run_snapshot con -c (no necesitas crear puerta nueva de momento)
-    # Si en un futuro creas un módulo propio (-m ...), podremos cambiar fácil la construcción del comando.
-
-    # ───────── helpers ─────────
+    # Helpers
     def allowed_senders(self) -> list[str]:
         raw = (self.IMAP_ALLOWED_SENDERS or "").strip()
         return [s.strip() for s in raw.split(",") if s.strip()]
@@ -70,24 +72,13 @@ class Settings:
         return {e.strip().lower() for e in self.ATTACH_WHITELIST.split(",") if e.strip()}
 
     def etl_cmd_parts(self) -> list[str]:
-        # separa respetando comillas simples/dobles
-        import shlex
-        return shlex.split(self.ETL_RUN_CMD)
+        return [t for t in self.ETL_RUN_CMD.split(" ") if t.strip()]
 
     def etl_workdir_path(self) -> Path:
         return Path(self.ETL_WORKDIR).resolve()
 
+    def snapshot_python_path(self) -> Path:
+        return Path(self.SNAPSHOT_PY).resolve()
+
     def snapshot_workdir_path(self) -> Path:
         return Path(self.SNAPSHOT_WORKDIR).resolve()
-
-    def snapshot_cmd_parts(self, company: str, project: str, year: int, month: int) -> list[str]:
-        """
-        Construye: <SNAPSHOT_PY> -c "from main import run_snapshot; run_snapshot(company='...', project='...', year=2025, month=8)"
-        Ejecuta en SNAPSHOT_WORKDIR. No dependemos de tener un entrypoint -m ahora.
-        """
-        # Repr seguro por si hay espacios/comillas en los nombres
-        code = (
-            "from main import run_snapshot; "
-            f"run_snapshot(company={company!r}, project={project!r}, year={int(year)}, month={int(month)})"
-        )
-        return [self.SNAPSHOT_PY, "-c", code]
