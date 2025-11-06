@@ -5,6 +5,7 @@ import base64
 from typing import List, Dict, Any, Iterable, Tuple, Optional
 import requests
 import msal
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -24,44 +25,73 @@ class GraphMailClient:
         self.user_id = user_id
         self.base = base.rstrip("/")
         self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
 
     # ───────── auth ─────────
     def _acquire_token(self) -> str:
-        if self._token:
+        """
+        Obtiene un access_token de MSAL y controla la caducidad.
+        Reutiliza el token si le queda más de 60 s de vida.
+        """
+        now = time.time()
+        if self._token and (self._token_expires_at - 60) > now:
             return self._token
+
         app = msal.ConfidentialClientApplication(
             client_id=self.client_id,
             client_credential=self.client_secret,
             authority=f"https://login.microsoftonline.com/{self.tenant_id}",
         )
-        result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+
+        # Intento silencioso (si MSAL tiene caché in-memory) y, si no, solicitud normal.
+        result = app.acquire_token_silent(scopes=["https://graph.microsoft.com/.default"], account=None)
+        if not result:
+            result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+
         if "access_token" not in result:
             raise RuntimeError(f"MSAL token error: {result}")
+
         self._token = result["access_token"]
+        self._token_expires_at = now + float(result.get("expires_in", 3600))
         return self._token
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self._acquire_token()}"}
 
+
     # ───────── HTTP helpers ─────────
     def _get(self, url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         r = requests.get(url, headers=self._headers(), params=params, timeout=30)
+        if r.status_code == 401:
+            # Token caducado → forzamos refresh y reintentamos UNA vez
+            self._token = None
+            self._token_expires_at = 0.0
+            r = requests.get(url, headers=self._headers(), params=params, timeout=30)
         r.raise_for_status()
         return r.json()
 
     def _post(self, url: str, json: Dict[str, Any]) -> requests.Response:
-        """
-        Devuelve el Response (Graph puede responder 202 sin cuerpo).
-        El caller decide si hace .json() o no.
-        """
-        r = requests.post(url, headers={**self._headers(), "Content-Type": "application/json"}, json=json, timeout=30)
+        """Devuelve el Response (Graph puede responder 202 sin cuerpo)."""
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        r = requests.post(url, headers=headers, json=json, timeout=30)
+        if r.status_code == 401:
+            self._token = None
+            self._token_expires_at = 0.0
+            headers = {**self._headers(), "Content-Type": "application/json"}
+            r = requests.post(url, headers=headers, json=json, timeout=30)
         r.raise_for_status()
         return r
 
-    def _patch(self, url: str, json: Dict[str, Any]) -> Dict[str, Any] | None:
-        r = requests.patch(url, headers={**self._headers(), "Content-Type": "application/json"}, json=json, timeout=30)
+    def _patch(self, url: str, json: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        r = requests.patch(url, headers=headers, json=json, timeout=30)
+        if r.status_code == 401:
+            self._token = None
+            self._token_expires_at = 0.0
+            headers = {**self._headers(), "Content-Type": "application/json"}
+            r = requests.patch(url, headers=headers, json=json, timeout=30)
         r.raise_for_status()
-        return r.json() if (r.text and r.headers.get("Content-Type","").startswith("application/json")) else None
+        return r.json() if (r.text and r.headers.get("Content-Type", "").startswith("application/json")) else None
 
     # ───────── folders ─────────
     def get_folder_id_by_path(self, path: str) -> str:
